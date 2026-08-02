@@ -172,12 +172,19 @@ last = res.latest
 # ---------------------------------------------------------------------------
 # Header
 # ---------------------------------------------------------------------------
+first_pub = res.diagnostics.get("first_publication")
+if first_pub is None:
+    st.warning(
+        f"**{res.target}** has {res.diagnostics['n_observations']:,} sessions — "
+        "too few for the engines to finish burning in, so no decision has been "
+        "published. Everything below is partial.")
+
 st.markdown(f"## {res.label} · `{res.target}`")
 st.caption(
     f"As of {summary['as_of']:%d %b %Y} · {res.diagnostics['n_explanatory']} "
     f"explanatory instruments · {res.diagnostics['n_observations']:,} sessions · "
-    f"first publication {res.diagnostics['first_publication']:%b %Y} · "
-    f"dataset fingerprint `{res.fingerprint}` · {res.model_version}")
+    + (f"first publication {first_pub:%b %Y} · " if first_pub is not None else "")
+    + f"dataset fingerprint `{res.fingerprint}` · {res.model_version}")
 
 pdo = summary["pdo"]
 pdo_colour = TH["pos"] if pdo > 0 else (TH["neg"] if pdo < 0 else TH["muted"])
@@ -582,15 +589,14 @@ with TABS[6]:
         ref = audited_view(res)
         with st.spinner("Re-running the stack on identical inputs…"):
             det = determinism_test(px, res.target, reference=ref)
-        st.session_state["det"] = det
         with st.spinner("Re-running the stack on a truncated record…"):
             rev = revision_invariance_test(px, res.target,
                                            truncations=(0.6, 0.85),
                                            reference=ref)
-        st.session_state["rev"] = rev
+        # keyed by asset so a result from a previous selection is never shown
+        st.session_state["tests"] = {res.target: (det, rev)}
 
-    det = st.session_state.get("det")
-    rev = st.session_state.get("rev")
+    det, rev = st.session_state.get("tests", {}).get(res.target, (None, None))
     if det:
         ok = det["passed"]
         st.markdown(
