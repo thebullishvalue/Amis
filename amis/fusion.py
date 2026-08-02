@@ -94,8 +94,7 @@ import numpy as np
 import pandas as pd
 
 from .causal import (EPS, DynamicModelAverage, ExpandingRank, OnlineCorr,
-                     OnlineLogistic, norm_cdf_scalar)
-from .dynamics import _probit
+                     OnlineLogistic, probit)
 
 #: Decision horizons in sessions (one week to one quarter).  The bank is the
 #: support of a prior over horizon; the weights are data-driven.
@@ -107,16 +106,25 @@ HORIZONS = (5, 21, 63)
 #: not.
 FUSION_DELTAS = (0.99, 0.995, 0.999, 1.0)
 
+#: The decision state vector.
+#:
+#: Latent factors are deliberately *not* entered raw.  They are what the Fair
+#: Value Oscillator is built out of, so adding them here would double-count
+#: the same information and let the fusion layer re-derive a valuation view
+#: that Engine 1 has already formed under a much stronger identification.
 FEATURES = [
     "const", "fvo", "do", "fvo_x_stress", "do_x_stress", "fvo_x_conf",
     "do_x_conf", "vol_state", "stability", "fvo_x_do",
+    "liquidity", "xs_consistency", "switch_hazard",
 ]
 NF = len(FEATURES)
 
-#: Indices whose coefficients enter the valuation sensitivity and the
-#: dynamics sensitivity respectively.
-_VAL_TERMS = (1, 3, 5, 9)
-_DYN_TERMS = (2, 4, 6, 9)
+IX = {name: i for i, name in enumerate(FEATURES)}
+
+
+def _p(v) -> float:
+    """A probability-scaled input; a missing one is uninformative, not zero."""
+    return 0.5 if not np.isfinite(v) else float(v)
 
 
 class _HorizonModel:
@@ -183,11 +191,10 @@ class DecisionFusionEngine:
 
         col = {c: np.asarray(mve[c].values, dtype=float) for c in
                ("fvo", "confidence", "stress", "xs_consistency", "switch_prob",
-                "xs_dispersion_pct", "pred_sd", "mr_prob")}
+                "xs_dispersion_pct")}
         dcol = {c: np.asarray(mde[c].values, dtype=float) for c in
                 ("do", "tech_confidence", "vol_percentile", "stability",
-                 "dyn_uncertainty", "volatility", "persistence_prob",
-                 "efficiency")}
+                 "dyn_uncertainty", "volatility")}
 
         models = [_HorizonModel(h) for h in HORIZONS]
         logw = np.zeros(len(HORIZONS))
@@ -213,16 +220,14 @@ class DecisionFusionEngine:
             if not (np.isfinite(fvo) and np.isfinite(do)):
                 continue
 
-            vc = col["confidence"][t]
-            tc = dcol["tech_confidence"][t]
-            st = col["stress"][t]
-            vp = dcol["vol_percentile"][t]
-            sb = dcol["stability"][t]
-            vc = 0.5 if not np.isfinite(vc) else vc
-            tc = 0.5 if not np.isfinite(tc) else tc
-            st = 0.5 if not np.isfinite(st) else st
-            vp = 0.5 if not np.isfinite(vp) else vp
-            sb = 0.5 if not np.isfinite(sb) else sb
+            vc = _p(col["confidence"][t])
+            tc = _p(dcol["tech_confidence"][t])
+            st = _p(col["stress"][t])
+            vp = _p(dcol["vol_percentile"][t])
+            sb = _p(dcol["stability"][t])
+            lq = _p(col["xs_dispersion_pct"][t])
+            xc = _p(col["xs_consistency"][t])
+            sw = _p(col["switch_prob"][t])
 
             f = np.clip(fvo / 3.0, -1.5, 1.5)
             d = np.clip(do / 3.0, -1.5, 1.5)
@@ -232,6 +237,7 @@ class DecisionFusionEngine:
                 f * (2.0 * vc - 1.0), d * (2.0 * tc - 1.0),
                 (2.0 * vp - 1.0), (2.0 * sb - 1.0),
                 f * d,
+                (2.0 * lq - 1.0), (2.0 * xc - 1.0), (2.0 * sw - 1.0),
             ])
             feats[t] = x
 
@@ -276,10 +282,16 @@ class DecisionFusionEngine:
             pdo = kappa * pdo_raw
 
             # ---- sensitivities: which engine is driving the decision -------
-            s_val = (coef[1] + coef[3] * (2.0 * st - 1.0)
-                     + coef[5] * (2.0 * vc - 1.0) + coef[9] * d)
-            s_dyn = (coef[2] + coef[4] * (2.0 * st - 1.0)
-                     + coef[6] * (2.0 * tc - 1.0) + coef[9] * f)
+            # d mu / d FVO and d mu / d DO, evaluated at today's state --
+            # every term that touches each oscillator, interactions included
+            s_val = (coef[IX["fvo"]]
+                     + coef[IX["fvo_x_stress"]] * (2.0 * st - 1.0)
+                     + coef[IX["fvo_x_conf"]] * (2.0 * vc - 1.0)
+                     + coef[IX["fvo_x_do"]] * d)
+            s_dyn = (coef[IX["do"]]
+                     + coef[IX["do_x_stress"]] * (2.0 * st - 1.0)
+                     + coef[IX["do_x_conf"]] * (2.0 * tc - 1.0)
+                     + coef[IX["fvo_x_do"]] * f)
             tot = abs(s_val) + abs(s_dyn)
             w_val = abs(s_val) / tot if tot > EPS else np.nan
             # sign agreement of the two engines' *contributions* to the
@@ -323,7 +335,7 @@ class DecisionFusionEngine:
             out["agreement"][t] = agree
             out["horizon_days"][t] = h_eff
             out["kelly_fraction"][t] = kelly
-            out["signal_state"][t] = _probit(u)
+            out["signal_state"][t] = probit(u)
             out["stance"][t] = _stance(pdo, kappa)
             coef_hist[t] = coef
 

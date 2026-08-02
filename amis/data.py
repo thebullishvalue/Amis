@@ -43,8 +43,34 @@ MIN_HISTORY = 250
 MAX_STALE = 30
 
 
+#: Symbols the vendor rejected are not re-requested for this many days.  The
+#: universe is a deliberate superset and a few of its lines are delisted at
+#: any moment; retrying them on every run costs a round trip and a warning
+#: each time, and the TTL means a symbol that comes back is picked up.
+FAILURE_TTL_DAYS = 7
+_FAILED_PATH = CACHE_DIR / "_unavailable.json"
+
+
 def _safe_name(ticker: str) -> str:
     return "".join(c if c.isalnum() or c in "-_" else "_" for c in ticker)
+
+
+def _load_failures() -> dict:
+    try:
+        import json
+        with open(_FAILED_PATH) as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def _save_failures(d: dict) -> None:
+    try:
+        import json
+        with open(_FAILED_PATH, "w") as fh:
+            json.dump(d, fh)
+    except Exception:
+        pass
 
 
 def _cache_path(ticker: str) -> Path:
@@ -158,7 +184,12 @@ def load_prices(
         else:
             to_fetch.setdefault(start, []).append(t)
 
-    groups = to_fetch
+    failures = _load_failures()
+    now = pd.Timestamp.today().normalize()
+    fresh = {t: d for t, d in failures.items()
+             if (now - pd.Timestamp(d)).days < FAILURE_TTL_DAYS}
+    groups = {s: [t for t in g if not (t in fresh and t not in out)]
+              for s, g in to_fetch.items()}
 
     total = sum(len(v) for v in groups.values())
     done = 0
@@ -167,13 +198,19 @@ def load_prices(
             chunk = group[i: i + batch_size]
             df = _download_batch(chunk, s, end)
             for t in chunk:
+                got = False
                 if t in df.columns:
                     ser = df[t].dropna()
                     if len(ser):
                         out[t] = _append_cache(t, ser)
+                        got = True
+                        fresh.pop(t, None)
+                if not got and t not in out:
+                    fresh[t] = now.strftime("%Y-%m-%d")
             done += len(chunk)
             if progress_cb is not None:
                 progress_cb(min(done / max(total, 1), 1.0))
+    _save_failures(fresh)
 
     if not out:
         return pd.DataFrame()
@@ -183,7 +220,15 @@ def load_prices(
     if end is not None:
         panel = panel.loc[: pd.Timestamp(end)]
     panel = panel.loc[pd.Timestamp(start):]
-    return panel
+    # Always return a column per requested instrument, empty if the vendor
+    # had nothing.  The cross-sectional dimension then depends on the
+    # universe definition rather than on whether one symbol happened to be
+    # reachable today -- otherwise two machines running the same version
+    # against the same dates could disagree about the factor structure.
+    missing = [t for t in tickers if t not in panel.columns]
+    for t in missing:
+        panel[t] = np.nan
+    return panel[sorted(panel.columns)]
 
 
 # ---------------------------------------------------------------------------
@@ -236,19 +281,27 @@ def build_panel(
     # An instrument contributes nothing before its own first print: carrying
     # a value forward from the past is a stale-quote assumption, carrying one
     # backward would be fabrication.
-    keep, dropped = [], {}
+    #
+    # Note what is *not* done here: columns are never removed, not even ones
+    # that never print at all.  Removing them would make the width of the
+    # panel a function of the record's endpoint -- truncate to 2017 and every
+    # instrument launched later disappears, changing the cross-sectional
+    # dimension, the Marchenko-Pastur edge, and therefore the factor
+    # structure of 2012.  An empty column costs nothing (it is never
+    # admitted) and keeps the panel's shape a property of the universe rather
+    # than of when the analysis happened to be run.
+    never = []
     for c in expl.columns:
         if not bool(printed[c].any()):
-            dropped[c] = "never printed on this calendar"
+            expl[c] = np.nan
+            never.append(c)
             continue
         fv = printed[c].idxmax()
         expl.loc[expl.index < fv, c] = np.nan
-        keep.append(c)
 
-    expl = expl[keep]
-    printed = printed[keep]
-    diag["n_explanatory"] = len(keep)
-    diag["dropped"] = dropped
+    diag["n_explanatory"] = int(expl.shape[1])
+    diag["n_never_printed"] = len(never)
+    diag["dropped"] = {c: "no print on this calendar" for c in never}
     diag["calendar_start"] = cal[0]
     diag["calendar_end"] = cal[-1]
     diag["n_observations"] = len(cal)

@@ -89,8 +89,9 @@ MIN_PRINTS = 250
 #: is degenerate for a *level* regression: the model that tracks price most
 #: closely always wins, and its limit is the useless statement "fair value =
 #: price".  Empirically, admitting delta = 0.99 (~5 months of memory)
-#: collapses the mispricing to 4% standard deviation with a 7-day half-life
-#: -- a residual, not a valuation.  A long-run relation that re-estimates
+#: collapses the mispricing by roughly a factor of three and its half-life
+#: from weeks to a few days -- a residual, not a valuation.  A long-run
+#: relation that re-estimates
 #: itself in months is not a long-run relation.  Within the slow family the
 #: data still selects, and the selection is stable: shifting the grid one
 #: notch slower moves the reported mispricing by well under a percentage
@@ -275,9 +276,16 @@ class MarketValuationEngine:
                 continue
 
             # ---- regressors -------------------------------------------------
+            # A factor that drops below the Marchenko-Pastur edge stops
+            # *accumulating* -- its level freezes -- but it is not zeroed out
+            # of the design.  Zeroing it would delete beta_j * F_j from the
+            # fitted level in a single session and put a step change in fair
+            # value at every point where the factor count moved, which the
+            # oscillator would then report as a mispricing.  A frozen level is
+            # a constant regressor: nearly collinear with the intercept, which
+            # the discounted prior handles, and continuous, which is what
+            # matters.
             Flat = np.concatenate([[1.0], finfo["levels"][:K_MAX]])
-            if k < K_MAX:                       # dormant factors contribute nothing
-                Flat[1 + k:] = 0.0
             Fblk = np.concatenate([[1.0], block_levels])
 
             if t < BURN_IN:

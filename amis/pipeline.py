@@ -135,8 +135,7 @@ def run_amis(
 
 
 def _first_valid(df: pd.DataFrame, col: str):
-    s = df[col].first_valid_index()
-    return s
+    return df[col].first_valid_index()
 
 
 def summarise(res: AMISResult) -> dict:

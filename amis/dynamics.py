@@ -16,8 +16,13 @@ memory inferred rather than declared:
 ===========================  =====================================================
 Latent quantity              Estimator
 ===========================  =====================================================
-Level, slope, curvature      Local linear trend DLM (Harvey 1989), discount bank
-Trend strength               Posterior t-ratio of the slope -- self-normalising
+Level, slope                 Local linear trend DLM (Harvey 1989), discount bank
+Trend strength               Drift accumulated over the filter's own inferred
+                             memory, in units of one standard deviation of that
+                             accumulation -- comparable across assets, unlike
+                             the posterior t-ratio, which grows without bound
+                             as the filter gains confidence and routinely
+                             exceeds 100
 Momentum persistence         Recursive AR(1) on the filtered slope
 Conditional volatility       Per-asset dynamic model averaging over EW memories
 Mean-reversion potential     Online Ornstein-Uhlenbeck fit to trend deviation
@@ -62,7 +67,8 @@ import numpy as np
 import pandas as pd
 
 from .causal import (EPS, DynamicModelAverage, EWMA, ExpandingRank, OnlineAR1,
-                     OnlineCorr, OnlineLogistic, OnlineSkill, norm_cdf_scalar)
+                     OnlineCorr, OnlineLogistic, OnlineSkill, norm_cdf_scalar,
+                     probit)
 from .factors import AdaptiveVolPanel
 from .regime import RegimeFilter
 
@@ -462,7 +468,7 @@ class MarketDynamicsEngine:
             do_rank.update(do_raw)
             # probit of the causal empirical rank: an oscillator whose scale
             # is fixed by the asset's own realised history, not by a constant
-            do = float(np.clip(_probit(u), -3.5, 3.5))
+            do = float(np.clip(probit(u), -3.5, 3.5))
 
             ent = cache["entropy"]
             eff_pct = ent_rank.cdf(ent) if np.isfinite(ent) else np.nan
@@ -557,33 +563,3 @@ class MarketDynamicsEngine:
             "feature_names": feat_names,
             "burn_in": BURN_IN,
         }
-
-
-def _probit(u: float) -> float:
-    """Inverse standard normal CDF (Acklam's rational approximation).
-
-    Accurate to ~1e-9 in the central region, which is far beyond what an
-    empirical CDF built from a few thousand points can resolve.
-    """
-    u = min(max(float(u), 1e-6), 1.0 - 1e-6)
-    a = (-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02,
-         1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00)
-    b = (-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02,
-         6.680131188771972e+01, -1.328068155288572e+01)
-    c = (-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00,
-         -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00)
-    d = (7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00,
-         3.754408661907416e+00)
-    pl, ph = 0.02425, 1.0 - 0.02425
-    if u < pl:
-        q = math.sqrt(-2.0 * math.log(u))
-        return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / \
-               ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
-    if u > ph:
-        q = math.sqrt(-2.0 * math.log(1.0 - u))
-        return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / \
-                ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
-    q = u - 0.5
-    rr = q * q
-    return (((((a[0] * rr + a[1]) * rr + a[2]) * rr + a[3]) * rr + a[4]) * rr + a[5]) * q / \
-           (((((b[0] * rr + b[1]) * rr + b[2]) * rr + b[3]) * rr + b[4]) * rr + 1.0)

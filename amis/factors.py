@@ -191,13 +191,31 @@ class _CorrMemory:
         return float(min(max(self.wbar * cap, 1.0), cap))
 
 
-def _clip_spectrum(C: np.ndarray, t_eff: float) -> tuple[np.ndarray, np.ndarray, float, int]:
+def _clip_spectrum(C: np.ndarray, t_eff: float,
+                   active: np.ndarray | None = None
+                   ) -> tuple[np.ndarray, np.ndarray, float, int]:
     """Marchenko-Pastur eigenvalue clipping.
 
     Returns (eigenvectors, eigenvalues, bulk level, k).  Eigenvalues above
     the MP upper edge are retained; the remainder are collapsed to their
     mean, which preserves the trace and leaves a positive-definite matrix.
+
+    `active` restricts the decomposition to the instruments admitted so far.
+    This matters for more than tidiness: the edge is (1 + sqrt(N/T))^2, so
+    counting instruments that have never traded inflates N and moves the
+    threshold.  Eigenvectors are scattered back to the full index with zeros
+    on the inactive rows, so downstream indexing is unaffected.
     """
+    n_full = C.shape[0]
+    if active is not None:
+        idx = np.flatnonzero(active)
+        if len(idx) < 3:
+            return np.zeros((n_full, 0)), np.zeros(0), 1.0, 0
+        Vs, ls, delta, k = _clip_spectrum(C[np.ix_(idx, idx)], t_eff, None)
+        V = np.zeros((n_full, Vs.shape[1]))
+        V[idx, :] = Vs
+        return V, ls, delta, k
+
     n = C.shape[0]
     C = 0.5 * (C + C.T)
     try:
@@ -291,6 +309,10 @@ class OnlineFactorModel:
         self.mem = [_CorrMemory(n, h) for h in memories]
         self.memories = memories
         self.active = len(memories) - 1        # start at the longest memory
+        #: Instruments admitted at least once so far.  Monotone by
+        #: construction, so it can only grow forward in time -- which is what
+        #: keeps the cross-sectional dimension free of hindsight.
+        self.ever_active = np.zeros(n, dtype=bool)
         self.t = 0
         self.k = 0
         self.levels = np.zeros(K_MAX)          # cumulative factor levels
@@ -312,7 +334,7 @@ class OnlineFactorModel:
             drift = float(np.linalg.norm(C - m.C_ref) / denom)
             if drift < 1.0 / math.sqrt(max(t_eff, 1.0)):
                 return
-        Vk, lk, delta, k = _clip_spectrum(C, t_eff)
+        Vk, lk, delta, k = _clip_spectrum(C, t_eff, self.ever_active)
         Vk, lk, _ = _align(Vk, lk, m.V, m.k)
         m.V = np.zeros((self.n, K_MAX))
         m.V[:, :Vk.shape[1]] = Vk
@@ -353,6 +375,8 @@ class OnlineFactorModel:
         zz = np.nan_to_num(zz, nan=0.0, posinf=0.0, neginf=0.0)
         mask = avail.astype(float)
         n_avail = int(mask.sum())
+        self.ever_active |= avail
+        n_active = max(int(self.ever_active.sum()), 1)
 
         # score each memory on data it has not yet absorbed
         if self.t > 0:
@@ -363,7 +387,9 @@ class OnlineFactorModel:
 
         outer = np.outer(zz, zz)
         mask_outer = np.outer(mask, mask)
-        frac = n_avail / max(self.n, 1)
+        # weight accumulation is measured against the admitted cross-section,
+        # not the nominal universe width
+        frac = n_avail / n_active
         for m in self.mem:
             m.absorb(outer, mask_outer, frac)
             self._maybe_recompute(m)
@@ -378,17 +404,23 @@ class OnlineFactorModel:
         if k > 0:
             V = m.V[:, :k]
             lam = np.maximum(m.lam_eig[:k], 1e-6)
-            # renormalise the loading vector over the instruments that
-            # actually traded, so a closed market does not shrink the factor
-            norm = np.sqrt(np.maximum((V ** 2 * mask[:, None]).sum(axis=0), 1e-9))
+            # Fraction of each factor's squared loading mass that actually
+            # traded today.  Renormalising by it compensates for a closed
+            # market rather than letting the factor shrink toward zero --
+            # but only while enough of the factor is observable.  Below a
+            # quarter of its mass, dividing through would amplify whatever
+            # did trade into a move the factor did not make; the honest
+            # reading of a factor whose constituents are shut is that it did
+            # not move, so the score is zero and the level simply holds.
+            observable = (V ** 2 * mask[:, None]).sum(axis=0)
+            usable = observable >= 0.25
+            norm = np.sqrt(np.maximum(observable, 1e-9))
             proj = (V * mask[:, None]).T @ zz
-            # unit-variance scores: Var(V_j' z) = lambda_j, and dividing by
-            # the restricted norm compensates for instruments that did not
-            # trade rather than letting the factor shrink toward zero
-            s = proj / (norm * np.sqrt(lam))
+            denom = np.where(usable, norm * np.sqrt(lam), np.inf)
+            s = proj / denom
             scores[:k] = s
             # exact per-instrument attribution of the factor increment
-            inc = (V * mask[:, None]) * zz[:, None] / (norm * np.sqrt(lam))[None, :]
+            inc = (V * mask[:, None]) * zz[:, None] / denom[None, :]
             self.contrib[:k] += inc.T
             self.levels[:k] += s
 
@@ -402,7 +434,8 @@ class OnlineFactorModel:
             "memory": self.memories[self.active],
             "memory_weights": w,
             "t_eff": m.t_eff,
-            "explained": float(np.sum(m.lam_eig[:k]) / max(self.n, 1)) if k else 0.0,
+            "n_active": n_active,
+            "explained": float(np.sum(m.lam_eig[:k]) / n_active) if k else 0.0,
         }
 
     def loadings(self) -> np.ndarray:

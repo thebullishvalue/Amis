@@ -12,8 +12,8 @@ References
 ----------
 West, M. & Harrison, J. (1997). *Bayesian Forecasting and Dynamic Models*,
     2nd ed., Springer.  Chapters 4 & 6: the discounted Normal-Gamma DLM used
-    by :class:`DiscountDLM` (unknown observation variance, variance
-    discounting in place of an explicit state-noise covariance Q).
+    by :class:`BatchDLM` (unknown observation variance, variance discounting
+    in place of an explicit state-noise covariance Q).
 Raftery, A. E., Karny, M. & Ettler, P. (2010). "Online Prediction Under
     Model Uncertainty via Dynamic Model Averaging." *Technometrics* 52(1).
     The recursive model-probability update used by :class:`DynamicModelAverage`.
@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import bisect
 import math
-from dataclasses import dataclass
 
 import numpy as np
 
@@ -224,106 +223,33 @@ class OnlineAR1:
 # ===========================================================================
 # 2. Discounted dynamic linear model  (West & Harrison 1997)
 # ===========================================================================
-@dataclass
-class DLMState:
-    m: np.ndarray          # posterior mean of the coefficient vector
-    C: np.ndarray          # posterior scale matrix (variance = C * S)
-    n: float               # degrees of freedom of the variance posterior
-    S: float               # point estimate of the observation variance
-
-
-class DiscountDLM:
-    """Time-varying-parameter regression with unknown observation variance.
-
-    Model (West & Harrison 1997, ch. 4):
-
-        y_t        = F_t' theta_t + nu_t ,     nu_t ~ N(0, V)
-        theta_t    = theta_{t-1} + omega_t ,   omega_t ~ N(0, W_t)
-
-    The state-noise covariance W_t is not estimated directly; it is induced by
-    *discounting* the prior scale, R_t = C_{t-1} / delta.  A single scalar
-    delta in (0,1] therefore indexes the whole family from "coefficients are
-    constant" (delta = 1, i.e. recursive least squares) to "coefficients move
-    freely".  V is unknown and handled conjugately (Normal-Gamma), giving a
-    Student-t one-step predictive distribution -- heavy tails come for free,
-    which matters for financial residuals.
-
-    Everything the filter emits at time t is a function of y_{1:t-1} and F_t.
-    """
-
-    def __init__(self, k: int, delta: float, prior_scale: float = 1.0,
-                 prior_var: float = 1.0, n0: float = 1.0,
-                 prior_mean: np.ndarray | None = None) -> None:
-        self.k = k
-        self.delta = float(delta)
-        self.state = DLMState(
-            m=np.zeros(k) if prior_mean is None else np.asarray(prior_mean, float).copy(),
-            C=np.eye(k) * float(prior_scale),
-            n=float(n0),
-            S=float(prior_var),
-        )
-        # Ceiling on the scale matrix.  A regressor that is identically zero
-        # for a long stretch (a latent factor that has not yet emerged) would
-        # otherwise see its prior variance grow like delta^-t and overflow.
-        self._c_max = float(prior_scale) * 1e6
-        self.log_pred_lik = 0.0
-
-    # -- prediction ---------------------------------------------------------
-    def forecast(self, F: np.ndarray) -> tuple[float, float, float]:
-        """One-step predictive (mean, scale^2, dof) given regressors F_t."""
-        s = self.state
-        R = s.C / self.delta
-        f = float(F @ s.m)
-        Q = float(F @ R @ F) + s.S
-        return f, max(Q, VAR_FLOOR), s.n
-
-    # -- update -------------------------------------------------------------
-    def update(self, F: np.ndarray, y: float) -> tuple[float, float, float]:
-        """Absorb (F_t, y_t); returns the pre-update predictive (f, Q, dof)."""
-        s = self.state
-        R = s.C / self.delta
-        f = float(F @ s.m)
-        Q = float(F @ R @ F) + s.S
-        Q = max(Q, VAR_FLOOR)
-        dof = s.n
-
-        if np.isfinite(y):
-            e = y - f
-            A = (R @ F) / Q
-            # Student-t predictive log density (exact for this conjugate model)
-            z2 = (e * e) / Q
-            self.log_pred_lik = float(
-                math.lgamma(0.5 * (dof + 1.0)) - math.lgamma(0.5 * dof)
-                - 0.5 * math.log(math.pi * dof * Q)
-                - 0.5 * (dof + 1.0) * math.log1p(z2 / dof)
-            )
-            n_new = dof + 1.0
-            S_new = s.S + (s.S / n_new) * (z2 - 1.0)
-            S_new = max(S_new, VAR_FLOOR)
-            m_new = s.m + A * e
-            C_new = (S_new / s.S) * (R - np.outer(A, A) * Q)
-            # symmetrise and guard against drift into indefiniteness
-            C_new = 0.5 * (C_new + C_new.T)
-            d = np.diag(C_new).copy()
-            np.fill_diagonal(C_new, np.clip(d, VAR_FLOOR, self._c_max))
-            self.state = DLMState(m=m_new, C=C_new, n=n_new, S=S_new)
-        else:
-            self.log_pred_lik = -np.inf
-            d = np.diag(R).copy()
-            np.fill_diagonal(R, np.clip(d, VAR_FLOOR, self._c_max))
-            self.state = DLMState(m=s.m, C=R, n=dof, S=s.S)
-        return f, Q, dof
-
-
 class BatchDLM:
-    """M discounted DLMs advanced simultaneously as dense array arithmetic.
+    """A bank of M discounted dynamic linear models, advanced together.
 
-    Mathematically identical to M independent :class:`DiscountDLM` instances;
-    the batching exists because the engines run banks of 5-15 filters at
-    every one of several thousand timestamps, and a Python-level loop over
-    them dominates the runtime.  Each member may carry its own discount
-    factor *and* its own regressor vector, which is what the
-    leave-one-block-out ablation needs.
+    Model (West & Harrison 1997, ch. 4), per member:
+
+        y_t     = F_t' theta_t + nu_t ,      nu_t ~ N(0, V)
+        theta_t = G theta_{t-1} + omega_t ,  omega_t ~ N(0, W_t)
+
+    The state-noise covariance W_t is not estimated directly; it is induced
+    by *discounting* the prior scale, R_t = G C_{t-1} G' / delta.  A single
+    scalar delta in (0,1] therefore indexes the whole family from "the
+    coefficients are constant" (delta = 1, i.e. recursive least squares) to
+    "they move freely", which is what lets adaptation speed be inferred
+    rather than declared.  V is unknown and handled conjugately
+    (Normal-Gamma), so the one-step predictive is Student-t -- heavy tails
+    come for free, and financial residuals have them.
+
+    G = I gives a time-varying-parameter regression; G = [[1,1],[0,1]] with
+    F = (1,0) gives the local linear trend of Harvey (1989).
+
+    Every member may carry its own discount factor *and* its own regressor
+    vector, which is what the leave-one-block-out ablation needs.  The
+    batching is not an optimisation detail: the engines advance banks of
+    5-15 filters at each of several thousand timestamps, and a Python-level
+    loop over them dominates the runtime.
+
+    Everything emitted at time t is a function of y_{1:t-1} and F_t.
     """
 
     def __init__(self, m: int, k: int, deltas, prior_scale: float = 1.0,
@@ -382,8 +308,21 @@ class BatchDLM:
             return f, Q
 
         e = y - f
-        z2 = e * e / Q
         dof = self.n
+        # Huberised innovation.  The conjugate Normal-Gamma variance update
+        # multiplies S by (1 + (z^2 - 1)/n), so one wild standardised
+        # innovation can inflate the variance estimate by orders of magnitude
+        # and, through the (S_new/S) factor on the scale matrix, take the
+        # whole filter with it -- an overflow observed on real data before
+        # this bound was added.  Capping the influence of a single
+        # observation at ten predictive standard deviations is the standard
+        # robustification (Masreliez 1975; West & Harrison's monitoring and
+        # intervention). Under the model an innovation that large is not
+        # evidence about the variance, it is an outlier.
+        z = e / np.sqrt(Q)
+        z = np.clip(z, -10.0, 10.0)
+        e = z * np.sqrt(Q)
+        z2 = z * z
         self.log_pred_lik = (
             _lgamma(0.5 * (dof + 1.0)) - _lgamma(0.5 * dof)
             - 0.5 * np.log(np.pi * dof * Q)
@@ -398,6 +337,16 @@ class BatchDLM:
         C_new = 0.5 * (C_new + np.transpose(C_new, (0, 2, 1)))
         d = np.einsum("mii->mi", C_new)
         np.clip(d, VAR_FLOOR, self._c_max, out=d)
+        # Bound the whole matrix, not just its diagonal.  Clipping only the
+        # diagonal of a matrix whose off-diagonals keep growing destroys
+        # positive-definiteness; rescaling preserves the correlation
+        # structure while keeping the magnitude finite.  A regressor that is
+        # identically zero for years -- a latent factor that has not yet
+        # emerged -- otherwise sees its prior variance grow like delta^-t.
+        scale = np.max(np.abs(C_new), axis=(1, 2))
+        over = scale > self._c_max
+        if np.any(over):
+            C_new[over] *= (self._c_max / scale[over])[:, None, None]
         self.C = C_new
         self.n = n_new
         self.S = S_new
@@ -655,3 +604,33 @@ def norm_cdf(x):
 
 def norm_cdf_scalar(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def probit(u: float) -> float:
+    """Inverse standard normal CDF (Acklam's rational approximation).
+
+    Accurate to ~1e-9 in the central region, which is far beyond what an
+    empirical CDF built from a few thousand points can resolve.
+    """
+    u = min(max(float(u), 1e-6), 1.0 - 1e-6)
+    a = (-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02,
+         1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00)
+    b = (-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02,
+         6.680131188771972e+01, -1.328068155288572e+01)
+    c = (-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00,
+         -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00)
+    d = (7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00,
+         3.754408661907416e+00)
+    pl, ph = 0.02425, 1.0 - 0.02425
+    if u < pl:
+        q = math.sqrt(-2.0 * math.log(u))
+        return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / \
+               ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
+    if u > ph:
+        q = math.sqrt(-2.0 * math.log(1.0 - u))
+        return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / \
+                ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
+    q = u - 0.5
+    rr = q * q
+    return (((((a[0] * rr + a[1]) * rr + a[2]) * rr + a[3]) * rr + a[4]) * rr + a[5]) * q / \
+           (((((b[0] * rr + b[1]) * rr + b[2]) * rr + b[3]) * rr + b[4]) * rr + 1.0)

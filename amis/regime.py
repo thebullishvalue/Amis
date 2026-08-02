@@ -38,7 +38,7 @@ import math
 
 import numpy as np
 
-from .causal import EPS, VAR_FLOOR, halflife_to_lambda
+from .causal import EPS, halflife_to_lambda
 
 #: Observations absorbed before the filter emits anything.  Set by
 #: identifiability of K Gaussian components, not by preference.
@@ -86,12 +86,20 @@ class _HMM:
             self.m2[j] = (self.var[j] + self.mu[j] ** 2) * self.n[j]
         self.ready = True
 
-    def _emission(self, y: np.ndarray) -> np.ndarray:
+    def _emission(self, y: np.ndarray) -> tuple[np.ndarray, float]:
+        """Relative emission likelihoods and the log offset removed from them.
+
+        The offset has to be returned, not discarded: the filtered likelihood
+        is what weights this model against the ones with a different state
+        count, and models with different K carry different offsets.  Dropping
+        it would make the comparison meaningless in exactly the way that is
+        hard to notice, because the weights would still look plausible.
+        """
         v = np.maximum(self.var, 1e-4)
         ll = -0.5 * np.sum(np.log(2.0 * math.pi * v) + (y[None, :] - self.mu) ** 2 / v,
                            axis=1)
-        ll = np.clip(ll - ll.max(), -60.0, 0.0)
-        return np.exp(ll)
+        mx = float(ll.max())
+        return np.exp(np.clip(ll - mx, -60.0, 0.0)), mx
 
     def step(self, y: np.ndarray) -> dict | None:
         """Filter one observation and absorb it. Returns pre-update diagnostics."""
@@ -102,13 +110,13 @@ class _HMM:
             return None
 
         pred = self.alpha @ self.A                     # P(S_t | y_1..t-1)
-        b = self._emission(y)
+        b, offset = self._emission(y)
         joint = pred * b
         tot = float(joint.sum())
         if tot <= EPS or not np.isfinite(tot):
             return {"alpha": self.alpha.copy(), "pred": pred, "loglik": 0.0}
         alpha_new = joint / tot
-        self.loglik = math.log(max(tot, 1e-300))
+        self.loglik = math.log(max(tot, 1e-300)) + offset
 
         # filtered two-slice statistic: the causal stand-in for the smoothed
         # xi of Baum-Welch
