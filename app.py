@@ -88,6 +88,18 @@ def fig(f, key: str) -> None:
                     config={"displayModeBar": False, "scrollZoom": False})
 
 
+def _memo(key: str, fn, *args):
+    """Per-session memo for derived views of an already-computed result.
+
+    Streamlit re-executes the whole script on every interaction; the result
+    object itself is cached, but the summaries derived from it are not
+    hashable inputs, so they are keyed by (asset, dataset fingerprint) here.
+    """
+    if key not in st.session_state:
+        st.session_state[key] = fn(*args)
+    return st.session_state[key]
+
+
 # ---------------------------------------------------------------------------
 # Cached computation
 # ---------------------------------------------------------------------------
@@ -179,10 +191,12 @@ if first_pub is None:
         "too few for the engines to finish burning in, so no decision has been "
         "published. Everything below is partial.")
 
+n_admitted = int(last.get("n_available", 0) or 0)
 st.markdown(f"## {res.label} · `{res.target}`")
 st.caption(
-    f"As of {summary['as_of']:%d %b %Y} · {res.diagnostics['n_explanatory']} "
-    f"explanatory instruments · {res.diagnostics['n_observations']:,} sessions · "
+    f"As of {summary['as_of']:%d %b %Y} · {n_admitted} of "
+    f"{res.diagnostics['n_explanatory']} instruments admitted today · "
+    f"{res.diagnostics['n_observations']:,} sessions · "
     + (f"first publication {first_pub:%b %Y} · " if first_pub is not None else "")
     + f"dataset fingerprint `{res.fingerprint}` · {res.model_version}")
 
@@ -445,7 +459,7 @@ with TABS[3]:
                "using only what it knew that day.")
 
     st.markdown("**Walk-forward evaluation**")
-    wf = walk_forward_report(res)
+    wf = _memo(f"wf::{res.target}::{res.fingerprint}", walk_forward_report, res)
     st.dataframe(wf["table"], width='stretch', hide_index=True)
     st.caption("Rank IC is Spearman correlation between the published signal "
                "and the subsequent standardised return. The t-statistic is "
@@ -552,7 +566,8 @@ with TABS[5]:
                    "normalised by its own volatility.")
 
     st.markdown("**Oscillator distribution analysis**")
-    dist = oscillator_distribution(res)
+    dist = _memo(f"dist::{res.target}::{res.fingerprint}",
+                 oscillator_distribution, res)
     st.dataframe(dist, width='stretch', hide_index=True)
     cols = st.columns(3)
     for i, (name, col) in enumerate([("Fair Value Oscillator", "fvo"),
@@ -581,7 +596,10 @@ with TABS[6]:
     m[0].metric("Dataset fingerprint", res.fingerprint)
     m[1].metric("Model version", res.model_version)
     m[2].metric("Compute", f"{d['seconds_mve'] + d['seconds_mde'] + d['seconds_dfe']:.0f}s")
-    m[3].metric("Explanatory instruments", d["n_explanatory"])
+    m[3].metric("Instruments admitted", f"{n_admitted} / {d['n_explanatory']}",
+                help="Admission is causal: an instrument joins the "
+                     "cross-section on the day its own accumulated print "
+                     "count first reaches the estimability floor.")
 
     run_tests = st.button("Run integrity tests", type="secondary")
     if run_tests:
@@ -632,10 +650,13 @@ came after it. Only the forward filter is used here, which is why the regime
 history looks less decisive than the ones usually published — it is the honest
 one.
 
-**Instrument admission is causal.** An instrument joins the cross-section on
-the day its own accumulated print count first reaches the estimability floor.
-Screening the panel on total history would let a fund launched in 2021 rewrite
-the factor structure of 2015.
+**Instrument admission is causal, and the panel's width does not depend on
+when you ran it.** An instrument joins the cross-section on the day its own
+accumulated print count first reaches the estimability floor. Columns are never
+dropped — not even ones that never print — because the Marchenko-Pastur edge is
+(1 + √(N/T))², so a panel that narrows when you truncate the record would change
+the factor structure of 2012 as soon as you extend it to 2026. This was a real
+bug, caught by the test on this page and not by reading the code.
 
 **Labels lag by their horizon.** The fusion model that speaks at *t* was
 trained on outcomes observable through *t − h*, and it is scored against the
@@ -720,11 +741,12 @@ forward returns is *measured* rather than a fitted forecast.
 **Scoring discount factors by one-step predictive likelihood is degenerate for
 a level regression.** The model that tracks price most closely always wins, and
 its limit is the useless statement "fair value = price". Admitting a five-month
-coefficient memory collapsed the mispricing to 4% standard deviation with a
-seven-day half-life. The valuation family is therefore restricted to memories
-of four years and longer, within which the data still selects; shifting the
-grid a notch slower moves the reported mispricing by well under a percentage
-point.
+coefficient memory collapsed the mispricing to a 0.8% standard deviation with a
+three-day half-life on SPY, and 4.4% with a seven-day half-life on AAPL —
+residuals, not valuations. The valuation family is therefore restricted to
+coefficient memories of four years and longer, within which the data still
+selects; shifting the grid a notch slower moves the reported mispricing by well
+under a percentage point.
 
 </div>
 """, unsafe_allow_html=True)

@@ -4,7 +4,7 @@ Three latent inference problems about any traded asset, answered from the
 global cross-section, with one input: **which asset**.
 
 ```
-                        Global market data (~225 instruments)
+                        Global market data (227 instruments, 12 asset classes)
                                        │
               ┌────────────────────────┴────────────────────────┐
               ▼                                                 ▼
@@ -25,7 +25,7 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-The first run downloads ~225 instruments (about a minute) into an append-only
+The first run downloads 227 instruments (about a minute) into an append-only
 parquet store under `.amis_cache/`; later runs are incremental. A full
 analysis is roughly 45 seconds of compute.
 
@@ -123,7 +123,7 @@ than asserting them (Integrity tab), and they hold to the last bit:
 
 ```
 Determinism         PASS   max |difference| = 0.0
-Revision invariance PASS   max |revision|   = 0.0   (records truncated to 50–90%)
+Revision invariance PASS   max |revision|   = 0.0   (records truncated to 40%, 65%, 90%)
 ```
 
 What makes that true by construction:
@@ -136,11 +136,17 @@ What makes that true by construction:
   the regime it assigns to a date is computed from data that came after it.
   Only the forward filter is used here — which is why this regime history looks
   less decisive than most published ones, and why it is the honest one.
-- **Instrument admission is causal.** An instrument joins the cross-section on
-  the day its own accumulated print count first reaches the estimability floor.
-  Screening the panel on total history would let a fund launched in 2021
-  rewrite the factor structure of 2015 — a data-layer repaint that leaves
-  every line of the inference code blameless.
+- **Instrument admission is causal, and the panel's width is not a function of
+  when you ran it.** An instrument joins the cross-section on the day its own
+  accumulated print count first reaches the estimability floor. Columns are
+  never dropped — not even ones that never print — because dropping them would
+  make the cross-sectional dimension depend on the record's endpoint, and the
+  Marchenko–Pastur edge is (1 + √(N/T))², so N moving would change the factor
+  structure of 2012 when you extend the record to 2026. *This was a real bug,
+  caught by the revision test on live data and not by reading the code*: the
+  factor count screen was already causal, but truncating the record to 2017
+  still removed every instrument launched after it. The fix was to decompose
+  only the admitted sub-cross-section and let dead columns cost nothing.
 - **Labels lag by their horizon.** The fusion model speaking at *t* was trained
   on outcomes observable through *t − h*, and is scored against the prediction
   it actually emitted, not a re-prediction from today's parameters.
@@ -189,7 +195,7 @@ amis/
   causal.py            Forward-recursion primitives: discounted DLM bank,
                        dynamic model averaging, online logistic, expanding CDF
   data.py              Append-only price store, causal panel construction
-  universe.py          ~225 explanatory instruments across 12 asset classes
+  universe.py          227 explanatory instruments across 12 asset classes
   factors.py           Online PCA, Marchenko–Pastur clipping, adaptive volatility
   regime.py            Forward-filtered online HMM, averaged over state counts
   valuation.py         Engine 1 — Market Valuation
@@ -198,7 +204,20 @@ amis/
   pipeline.py          Orchestration; a pure function of (asset, prices, version)
   validation.py        Determinism, revision invariance, walk-forward scoring
   viz.py               Plotly layer (validated colourblind-safe palette)
+tests/test_amis.py     23 checks on synthetic data
 ```
+
+```bash
+python -m pytest tests -q          # offline, ~4 minutes
+```
+
+The suite covers the two claims above plus a stronger one — **corrupting the
+tail of the record must leave every value in the head bit-identical** — and
+pins the primitives: the DLM recovers known coefficients, the
+Marchenko–Pastur clip finds no factor in pure noise and does find a planted
+one, permutation entropy is ~1 on i.i.d. data and ~0 on a monotone path, Burg
+recovers a planted 40-session cycle, and the factor attributions reconstruct
+the factor levels to 1e-8.
 
 Every internal constant is either a machine-precision guard, a statistical
 necessity (a second moment needs ~250 observations), the support of a prior
