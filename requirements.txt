@@ -1,0 +1,14 @@
+# AMIS — Autonomous Market Intelligence System
+streamlit>=1.40
+pandas>=2.0
+numpy>=1.24,<2.0
+scipy>=1.11
+plotly>=5.20
+yfinance>=0.2.50
+pyarrow>=14.0        # append-only parquet price store
+
+# Optional accelerator. Lempel-Ziv complexity is an O(n^2) scan in pure
+# Python and dominates the dynamics engine without it (~15s vs ~0.2s per
+# asset). The result is bit-identical either way — the pure-Python fallback
+# is the same function, so determinism does not depend on this being present.
+numba>=0.58
