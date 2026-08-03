@@ -21,13 +21,18 @@ its own first print.
 from __future__ import annotations
 
 import hashlib
+import logging
 import warnings
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
+from .resilience import (CircuitBreakerError, RetryWithBackoff, all_caches,
+                         all_circuits, yfinance_circuit)
+
 warnings.filterwarnings("ignore", category=FutureWarning)
+log = logging.getLogger(__name__)
 
 CACHE_DIR = Path(__file__).resolve().parent.parent / ".amis_cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -50,24 +55,31 @@ MAX_STALE = 30
 FAILURE_TTL_DAYS = 7
 _FAILED_PATH = CACHE_DIR / "_unavailable.json"
 
+#: Earliest start already attempted per ticker.  An instrument that did not
+#: exist in 2005 has no 2005 history to backfill, and without this record the
+#: store would re-request it on every single run -- roughly forty futile round
+#: trips per analysis, which is most of the warm-start latency and most of the
+#: exposure to a flaky resolver.
+_BACKFILL_PATH = CACHE_DIR / "_backfilled.json"
+
 
 def _safe_name(ticker: str) -> str:
     return "".join(c if c.isalnum() or c in "-_" else "_" for c in ticker)
 
 
-def _load_failures() -> dict:
+def _load_json(path: Path) -> dict:
     try:
         import json
-        with open(_FAILED_PATH) as fh:
+        with open(path) as fh:
             return json.load(fh)
     except Exception:
         return {}
 
 
-def _save_failures(d: dict) -> None:
+def _save_json(path: Path, d: dict) -> None:
     try:
         import json
-        with open(_FAILED_PATH, "w") as fh:
+        with open(path, "w") as fh:
             json.dump(d, fh)
     except Exception:
         pass
@@ -80,27 +92,21 @@ def _cache_path(ticker: str) -> Path:
 # ---------------------------------------------------------------------------
 # Download
 # ---------------------------------------------------------------------------
-def _download_batch(tickers: list[str], start: str, end: str | None) -> pd.DataFrame:
-    """Adjusted closes for a batch of tickers; missing names simply absent."""
+@RetryWithBackoff(max_retries=2, initial_delay=1.5, backoff_factor=2.0)
+def _raw_download(tickers: tuple[str, ...], start: str, end: str | None) -> pd.DataFrame:
+    """One raw Yahoo batch call.  Retried on a whole-batch failure."""
     import yfinance as yf
 
-    if not tickers:
-        return pd.DataFrame()
-    try:
-        raw = yf.download(
-            tickers,
-            start=start,
-            end=end,
-            progress=False,
-            auto_adjust=True,
-            threads=True,
-            group_by="column",
-        )
-    except Exception:
-        return pd.DataFrame()
+    raw = yf.download(
+        list(tickers), start=start, end=end, progress=False,
+        auto_adjust=True, threads=True, group_by="column",
+    )
     if raw is None or len(raw) == 0:
-        return pd.DataFrame()
+        raise ValueError("empty response")
+    return raw
 
+
+def _extract_close(raw: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
     if isinstance(raw.columns, pd.MultiIndex):
         if "Close" not in raw.columns.get_level_values(0):
             return pd.DataFrame()
@@ -108,10 +114,87 @@ def _download_batch(tickers: list[str], start: str, end: str | None) -> pd.DataF
     else:
         close = raw[["Close"]].copy()
         close.columns = [tickers[0]]
-
     close.index = pd.to_datetime(close.index).tz_localize(None).normalize()
     close = close[~close.index.duplicated(keep="last")].sort_index()
     return close.astype(float)
+
+
+def _download_batch(tickers: list[str], start: str, end: str | None) -> pd.DataFrame:
+    """Adjusted closes for a batch, through the retry + circuit-breaker path.
+
+    A batch is one HTTP call but Yahoo rate-limits a few symbols within it, so
+    the response routinely comes back incomplete.  Rather than accept the gap,
+    the symbols that are missing get one targeted re-fetch through the same
+    protections -- the difference between a 40-name batch returning 32 lines
+    and returning 40.  A *total* failure is an outage rather than per-symbol
+    limiting, and is left to the circuit breaker and the store's own history.
+    """
+    if not tickers:
+        return pd.DataFrame()
+    key = tuple(sorted(tickers))
+    try:
+        raw = yfinance_circuit.call(_raw_download, key, start, end)
+    except CircuitBreakerError as exc:
+        log.warning("yfinance circuit open, skipping batch: %s", exc)
+        return pd.DataFrame()
+    except Exception as exc:                    # noqa: BLE001
+        log.warning("yfinance batch failed: %s", exc)
+        return pd.DataFrame()
+
+    close = _extract_close(raw, tickers)
+    if close.empty:
+        return close
+
+    got = {c for c in close.columns if close[c].notna().any()}
+    missing = [t for t in tickers if t not in got]
+    if got and missing:
+        try:
+            raw2 = yfinance_circuit.call(_raw_download, tuple(sorted(missing)),
+                                         start, end)
+            recovered = _extract_close(raw2, missing)
+            if not recovered.empty:
+                keep = [c for c in recovered.columns if recovered[c].notna().any()]
+                if keep:
+                    log.info("re-fetch recovered %d/%d rate-limited symbols",
+                             len(keep), len(missing))
+                    close = close.join(recovered[keep], how="outer",
+                                       rsuffix="_dup")
+                    close = close[[c for c in close.columns
+                                   if not c.endswith("_dup")]]
+        except Exception as exc:                # noqa: BLE001
+            log.warning("targeted re-fetch of %d symbols failed: %s",
+                        len(missing), exc)
+    return close
+
+
+def probe_symbol(ticker: str, min_rows: int = 60) -> bool:
+    """Does this symbol return enough history to be worth analysing?
+
+    Used by free-form symbol resolution.  The probe writes into the same
+    append-only store the pipeline reads, so a successful resolution leaves
+    the data already cached rather than forcing a second download.
+    """
+    cached = _read_cached(ticker)
+    if cached is not None and len(cached) >= min_rows:
+        return True
+    end = pd.Timestamp.today().normalize()
+    start = (end - pd.Timedelta(days=365 * 12)).strftime("%Y-%m-%d")
+    df = _download_batch([ticker], start, None)
+    if ticker in df.columns:
+        ser = df[ticker].dropna()
+        if len(ser) >= min_rows:
+            _append_cache(ticker, ser)
+            return True
+    return False
+
+
+def fetch_health() -> dict:
+    """Circuit and cache state, for the diagnostics view."""
+    return {
+        "circuits": [c.get_state() for c in all_circuits()],
+        "caches": [c.stats() for c in all_caches()],
+        "store": cache_status(),
+    }
 
 
 def _read_cached(ticker: str) -> pd.Series | None:
@@ -165,6 +248,8 @@ def load_prices(
     tickers = list(dict.fromkeys(tickers))
     out: dict[str, pd.Series] = {}
     to_fetch: dict[str, list[str]] = {}
+    backfilled = _load_json(_BACKFILL_PATH)
+    start_ts = pd.Timestamp(start)
 
     for t in tickers:
         cached = _read_cached(t)
@@ -172,9 +257,15 @@ def load_prices(
             out[t] = cached
             # Backfill is as necessary as forward extension: a store warmed
             # by an earlier short request must not silently truncate a later
-            # long one.  Both directions only ever *add* rows.
-            if pd.Timestamp(start) < cached.index.min() - pd.Timedelta(days=5):
+            # long one.  Both directions only ever *add* rows.  It is tried
+            # once per (ticker, start) -- an instrument that did not exist
+            # then will never have history there, and asking again every run
+            # is pure latency.
+            tried = backfilled.get(t)
+            if (start_ts < cached.index.min() - pd.Timedelta(days=5)
+                    and (tried is None or start_ts < pd.Timestamp(tried))):
                 to_fetch.setdefault(start, []).append(t)
+                backfilled[t] = start
             if refresh:
                 last = cached.index.max()
                 nxt = (last + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
@@ -184,7 +275,7 @@ def load_prices(
         else:
             to_fetch.setdefault(start, []).append(t)
 
-    failures = _load_failures()
+    failures = _load_json(_FAILED_PATH)
     now = pd.Timestamp.today().normalize()
     fresh = {t: d for t, d in failures.items()
              if (now - pd.Timestamp(d)).days < FAILURE_TTL_DAYS}
@@ -210,7 +301,8 @@ def load_prices(
             done += len(chunk)
             if progress_cb is not None:
                 progress_cb(min(done / max(total, 1), 1.0))
-    _save_failures(fresh)
+    _save_json(_FAILED_PATH, fresh)
+    _save_json(_BACKFILL_PATH, backfilled)
 
     if not out:
         return pd.DataFrame()

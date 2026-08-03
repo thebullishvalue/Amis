@@ -324,8 +324,13 @@ class OnlineFactorModel:
     def _maybe_recompute(self, m: _CorrMemory) -> None:
         """Refresh the eigenbasis when the correlation matrix has moved by
         more than sampling noise, subject to a compute floor/ceiling."""
+        # Floor on how often the eigenbasis may be rebuilt.  This is a compute
+        # budget, not a model choice, and it scales with the cross-section
+        # because eigendecomposition is O(N^3): at N ~ 330 an unthrottled
+        # rebuild would dominate the run.  It is applied one-sidedly -- a held
+        # basis is always a *past* one -- so it cannot repaint.
         gap = self.t - m.last_recompute
-        if gap < 5 and m.k > 0:
+        if gap < max(5, int(self.ever_active.sum()) // 40) and m.k > 0:
             return
         C = m.correlation()
         t_eff = m.t_eff
