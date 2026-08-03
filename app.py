@@ -22,7 +22,9 @@ from amis import MODEL_VERSION
 from amis import viz
 from amis.data import cache_status
 from amis.pipeline import run_amis, summarise
-from amis.universe import UNIVERSE, UNIVERSE_TICKERS, selectable_assets
+from amis.universe import (ASSET_CLASSES, FREEFORM_STOCK_CLASSES, UNIVERSE,
+                           UNIVERSE_TICKERS, resolve_stock_symbol,
+                           target_classes)
 from amis.validation import (audited_view, determinism_test,
                              oscillator_distribution, revision_invariance_test,
                              walk_forward_report)
@@ -137,49 +139,162 @@ TODAY = pd.Timestamp.today().strftime("%Y-%m-%d")
 # ---------------------------------------------------------------------------
 # Sidebar: the single input
 # ---------------------------------------------------------------------------
+CLASSES = target_classes()
+CLASS_NAMES = list(FREEFORM_STOCK_CLASSES) + list(CLASSES)
+
 with st.sidebar:
     st.markdown("### ◈ AMIS")
     st.caption(f"Autonomous Market Intelligence System · {MODEL_VERSION}")
 
-    groups = selectable_assets()
-    options: list[str] = []
-    labels: dict[str, str] = {}
-    for grp, items in groups.items():
-        for tk, name in items:
-            options.append(tk)
-            labels[tk] = f"{name} ({tk}) · {grp}"
+    # Two-level selection: asset class, then instrument within it.  The class
+    # selector sits OUTSIDE the form so the instrument list repopulates as
+    # soon as the class changes; only the instrument choice and the run are
+    # submitted, so re-pointing the class never launches a computation.
+    st.markdown("**Asset class**")
+    sel_class = st.selectbox(
+        "Asset class", CLASS_NAMES, label_visibility="collapsed",
+        key="asset_class",
+        help="Choose a class, then an instrument within it. Every explanatory "
+             "instrument is also a valid target — the engine excludes a target "
+             "from its own panel automatically.")
 
-    default = options.index("SPY") if "SPY" in options else 0
-    choice = st.selectbox("Asset", options, index=default,
-                          format_func=lambda t: labels.get(t, t))
-    custom = st.text_input("…or any Yahoo Finance symbol", value="",
-                           placeholder="e.g. NVDA, BTC-USD, ^N225").strip().upper()
-    target = custom or choice
+    resolved: str | None = None
+    resolve_note = ""
+
+    if sel_class in FREEFORM_STOCK_CLASSES:
+        # India / US stocks: no fixed roster worth browsing — take a symbol
+        # directly. The class supplies the suffix policy (India probes
+        # SYMBOL.NS then SYMBOL.BO; US uses the bare symbol with . -> -).
+        market = FREEFORM_STOCK_CLASSES[sel_class]
+        st.markdown("**Symbol**")
+        with st.form("freeform", clear_on_submit=False):
+            raw_symbol = st.text_input(
+                "Symbol", label_visibility="collapsed",
+                key=f"symbol_{market}",
+                placeholder=("e.g. RELIANCE, TATASTEEL, INFY"
+                             if market == "india" else "e.g. AAPL, BRK.B, NVDA"))
+            go_btn = st.form_submit_button("Analyse", type="primary",
+                                           width="stretch")
+        st.caption("NSE (.NS) is checked first, then BSE (.BO)."
+                   if market == "india" else
+                   "US listing · symbol as typed (BRK.B → BRK-B).")
+        if go_btn and (raw_symbol or "").strip():
+            with st.spinner("Resolving symbol…"):
+                tk, exch_or_err = resolve_stock_symbol(raw_symbol, market)
+            if tk is None:
+                st.error(exch_or_err)
+                go_btn = False
+            else:
+                resolved = tk
+                resolve_note = f"{raw_symbol.strip().upper()} → {tk} · {exch_or_err}"
+        elif go_btn:
+            st.error("Enter a symbol.")
+            go_btn = False
+    else:
+        members = CLASSES[sel_class]
+        tickers = list(members)
+        st.markdown("**Instrument**")
+        with st.form("catalogue", clear_on_submit=False):
+            choice = st.selectbox(
+                "Instrument", tickers, label_visibility="collapsed",
+                key=f"instrument_{sel_class}",
+                format_func=lambda t: f"{members.get(t, t)}  ·  {t}")
+            go_btn = st.form_submit_button("Analyse", type="primary",
+                                           width="stretch")
+        resolved = choice
+        st.caption(f"{len(tickers)} instruments in this class.")
 
     st.caption("The asset is the only input. Every other quantity — memory, "
                "factor count, weighting, thresholds, horizon — is inferred.")
-    go_btn = st.button("Analyse", type="primary", width='stretch')
 
     st.divider()
     cs = cache_status()
     st.caption(f"Price store: {cs['n_series']} series · {cs['size_mb']} MB · "
-               "append-only")
+               "append-only · {} instruments in the panel".format(
+                   len(UNIVERSE_TICKERS)))
 
-if "target" not in st.session_state:
-    st.session_state["target"] = target
-if go_btn:
-    st.session_state["target"] = target
-target = st.session_state["target"]
+if go_btn and resolved:
+    st.session_state["target"] = resolved
+    if resolve_note:
+        st.session_state["resolve_note"] = resolve_note
+target = st.session_state.get("target")
+
+if not target:
+    st.markdown("## ◈ Autonomous Market Intelligence System")
+    st.markdown(f"""
+<div class='amis-note' style='max-width:52rem'>
+
+Three latent inference problems about any traded asset, answered from the
+global cross-section of {len(UNIVERSE_TICKERS)} instruments across
+{len(ASSET_CLASSES)} economic blocks.
+
+<b>Where should this asset be trading?</b> &nbsp;A dynamic cointegrating
+regression on the integrated common factors of the world prices it against
+the traded opportunity set. The residual is a level, so fair value is a
+price rather than a forecast.<br><br>
+
+<b>How is it behaving?</b> &nbsp;Not RSI or MACD — the latent quantities those
+approximate, estimated directly: trend and slope from a local linear trend
+model, roughness from the multiscale variance ratio, efficiency from
+permutation entropy, the dominant cycle from a maximum-entropy spectrum.<br><br>
+
+<b>What is the statistically optimal decision?</b> &nbsp;A Bayesian decision
+problem over both, with the horizon and the weighting inferred, shrunk by the
+association this model's own past predictions have actually shown with their
+outcomes. When nothing has been demonstrated, the oscillator reads exactly
+zero.
+
+<br>
+Every output is causal, deterministic and non-repainting, and the Integrity
+tab re-runs the engines to prove it rather than assert it.
+
+</div>
+""", unsafe_allow_html=True)
+    st.info("Choose an asset in the sidebar and press **Analyse**. "
+            "The first run downloads the universe and takes a minute or two; "
+            "after that the price store is warm and a full analysis is about "
+            "45 seconds.")
+    st.stop()
 
 try:
     res = _run(target, "2005-01-01", TODAY)
 except Exception as exc:                       # pragma: no cover - UI path
     st.error(f"Could not analyse **{target}** — {exc}")
+    st.session_state.pop("target", None)
     st.stop()
 
-S = res.series
+S_FULL = res.series
 summary = summarise(res)
 last = res.latest
+
+# ---------------------------------------------------------------------------
+# Timeframe
+# ---------------------------------------------------------------------------
+#: label -> trailing calendar offset.  None is the whole published record.
+TIMEFRAMES: dict[str, pd.DateOffset | None] = {
+    "1W": pd.DateOffset(weeks=1),
+    "1M": pd.DateOffset(months=1),
+    "3M": pd.DateOffset(months=3),
+    "6M": pd.DateOffset(months=6),
+    "1Y": pd.DateOffset(years=1),
+    "3Y": pd.DateOffset(years=3),
+    "ALL": None,
+}
+st.session_state.setdefault("tf", "1Y")
+
+
+def apply_timeframe(df: pd.DataFrame | pd.Series):
+    """Trailing window of a published series.
+
+    A view, never a recomputation: the engines have already run over the full
+    record, and the values inside the window are the ones they published at
+    the time. Cropping the x-axis cannot change an inference — which is the
+    whole point of building the record forward in the first place.
+    """
+    off = TIMEFRAMES.get(st.session_state["tf"])
+    if off is None or not len(df):
+        return df
+    return df.loc[df.index.max() - off:]
 
 # ---------------------------------------------------------------------------
 # Header
@@ -226,6 +341,27 @@ c[4].markdown(tile(
     f"valuation weight {summary['valuation_weight']:.0%}",
     frac=summary["valuation_weight"], colour=TH["series"][1]),
     unsafe_allow_html=True)
+
+st.write("")
+
+# ---------------------------------------------------------------------------
+# Timeframe control
+# ---------------------------------------------------------------------------
+tf_cols = st.columns([1] * len(TIMEFRAMES) + [6], gap="small")
+for i, label in enumerate(TIMEFRAMES):
+    with tf_cols[i]:
+        if st.button(label, key=f"tf_{label}", width="stretch",
+                     type="primary" if st.session_state["tf"] == label
+                     else "secondary"):
+            st.session_state["tf"] = label
+            st.rerun()
+
+S = apply_timeframe(S_FULL)
+_span = f"{S.index.min():%d %b %Y} — {S.index.max():%d %b %Y}" if len(S) else "—"
+tf_cols[-1].caption(
+    f"Charts show {st.session_state['tf']} · {_span} · {len(S):,} sessions. "
+    "The engines always run over the full record; the window is a view, so "
+    "changing it cannot change an inference.")
 
 st.write("")
 
@@ -305,7 +441,7 @@ with TABS[1]:
                    "discount factors. Neither is set by hand.")
 
     st.markdown("**Named economic drivers of fair value**")
-    fig(viz.contribution_heatmap(res.mve["block_contrib"], TH,
+    fig(viz.contribution_heatmap(apply_timeframe(res.mve["block_contrib"]), TH,
                                  title="Asset-class contribution to the fair value level"),
         "va_heat")
 
@@ -433,7 +569,7 @@ with TABS[3]:
             "prob_success": "P(favourable outcome)"}), TH,
             title="Quality of the current opportunity", ytitle="probability",
             fmt=":.1%"), "de_conf")
-        fig(viz.stacked_share(res.dfe["horizon_weights"], TH,
+        fig(viz.stacked_share(apply_timeframe(res.dfe["horizon_weights"]), TH,
                               title="Inferred decision horizon (posterior weight)",
                               ytitle="weight"), "de_hz")
     with b:
@@ -477,10 +613,10 @@ with TABS[4]:
     st.markdown("**Latent factor dashboard**")
     a, b = st.columns([3, 2])
     with a:
-        fig(viz.multi_line(res.mve["factor_levels"], TH, height=320,
+        fig(viz.multi_line(apply_timeframe(res.mve["factor_levels"]), TH, height=320,
                            title="Integrated latent factor levels",
                            ytitle="cumulative standardised factor"), "ex_fl")
-        fig(viz.contribution_heatmap(res.mve["factor_contrib"], TH,
+        fig(viz.contribution_heatmap(apply_timeframe(res.mve["factor_contrib"]), TH,
                                      title="Latent factor contribution to fair value",
                                      height=300, max_rows=10), "ex_fc")
     with b:
@@ -507,7 +643,7 @@ with TABS[4]:
                 title="Which instruments make up today's fair value",
                 xtitle="contribution to log fair value"), "ex_inst")
         with b:
-            fig(viz.contribution_heatmap(ia[list(top)].rename(
+            fig(viz.contribution_heatmap(apply_timeframe(ia)[list(top)].rename(
                 columns=lambda t: UNIVERSE.get(t, t)), TH, height=520,
                 title="…and how that has changed", max_rows=20), "ex_ih")
         st.caption("This is an exact decomposition, not an approximation: fair "
@@ -516,7 +652,7 @@ with TABS[4]:
                    "post-hoc explainer is involved.")
 
     st.markdown("**Decision coefficients**")
-    fig(viz.multi_line(res.dfe["coefficients"].drop(columns=["const"]), TH,
+    fig(viz.multi_line(apply_timeframe(res.dfe["coefficients"]).drop(columns=["const"]), TH,
                        height=320, title="Time-varying fusion coefficients",
                        ytitle="coefficient", max_series=6, fmt=":.3f"),
         "ex_coef")
